@@ -1,0 +1,9 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+*_files/
+*.html
+*.log
+*.tex
+*.knit.md

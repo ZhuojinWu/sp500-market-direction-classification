@@ -1,0 +1,247 @@
+---
+title: "S&P 500 Market Direction Classification"
+subtitle: "A leakage-aware logistic regression case study"
+author: "Jayking Wu, Wanxin Zhou, Michelle Xu, Xinxin Chen"
+output-file: sp500_market_direction_report.pdf
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=0.85in
+    fontsize: 10.5pt
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(broom)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 11))
+
+market <- read.csv("sp500_daily_data.csv", check.names = TRUE) %>%
+  mutate(
+    Time = as.Date(Time),
+    Close.Price = as.numeric(gsub(",", "", Close.Price))
+  ) %>%
+  arrange(Time)
+
+# Every feature is available before the market direction being predicted.
+model_data <- market %>%
+  mutate(
+    target_up = as.integer(Return > 0),
+    lag_return = lag(Return, 1),
+    prior_close = lag(Close.Price, 1),
+    volatility_5d = rollapply(
+      lag(Return, 1), width = 5, FUN = sd,
+      align = "right", fill = NA
+    ),
+    moving_average_10d = rollapply(
+      lag(Close.Price, 1), width = 10, FUN = mean,
+      align = "right", fill = NA
+    ),
+    moving_average_gap =
+      (prior_close - moving_average_10d) / moving_average_10d
+  ) %>%
+  drop_na()
+
+split_index <- floor(0.80 * nrow(model_data))
+train <- model_data[seq_len(split_index), ]
+test <- model_data[(split_index + 1):nrow(model_data), ]
+
+full_model <- glm(
+  target_up ~ lag_return + volatility_5d + moving_average_gap,
+  data = train,
+  family = binomial
+)
+
+candidate_models <- list(
+  "Full model" = full_model,
+  "Return + volatility" = glm(
+    target_up ~ lag_return + volatility_5d,
+    data = train, family = binomial
+  ),
+  "Return + trend gap" = glm(
+    target_up ~ lag_return + moving_average_gap,
+    data = train, family = binomial
+  ),
+  "Volatility + trend gap" = glm(
+    target_up ~ volatility_5d + moving_average_gap,
+    data = train, family = binomial
+  )
+)
+
+aic_table <- tibble(
+  Model = names(candidate_models),
+  AIC = map_dbl(candidate_models, AIC)
+) %>%
+  arrange(AIC) %>%
+  mutate(Delta_AIC = AIC - min(AIC))
+
+test <- test %>%
+  mutate(
+    predicted_probability = predict(
+      full_model, newdata = test, type = "response"
+    ),
+    predicted_class = as.integer(predicted_probability >= 0.50)
+  )
+
+test_accuracy <- mean(test$predicted_class == test$target_up)
+baseline_accuracy <- max(mean(test$target_up), 1 - mean(test$target_up))
+brier_score <- mean((test$predicted_probability - test$target_up)^2)
+
+confusion <- table(
+  Predicted = factor(test$predicted_class, levels = c(0, 1)),
+  Actual = factor(test$target_up, levels = c(0, 1))
+)
+
+tn <- confusion[1, 1]
+fn <- confusion[1, 2]
+fp <- confusion[2, 1]
+tp <- confusion[2, 2]
+sensitivity <- tp / (tp + fn)
+specificity <- tn / (tn + fp)
+balanced_accuracy <- mean(c(sensitivity, specificity))
+```
+
+# Executive Summary
+
+This case study tests whether a small set of lagged technical indicators can classify the next observed daily direction of the S&P 500. The workflow is designed to prevent look-ahead bias: each predictor uses information available no later than the prior trading day, and the final model is evaluated on the latest 20% of observations in chronological order.
+
+The logistic regression achieved **`r scales::percent(test_accuracy, accuracy = 0.1)` test accuracy**, compared with a **`r scales::percent(baseline_accuracy, accuracy = 0.1)` majority-class baseline**. The model therefore did not demonstrate reliable out-of-sample improvement over a naive benchmark. This negative result is informative: simple lagged return, volatility, and moving-average signals are not sufficient by themselves for dependable daily direction forecasting over this test period.
+
+# Business Question
+
+Can recent price behavior provide a useful, interpretable signal for whether the S&P 500 closes up or down on the next observed trading day?
+
+The objective is classification, not causal inference or investment advice. A useful model should outperform a transparent baseline on future, unseen observations rather than only fitting historical data well.
+
+# Data and Feature Engineering
+
+The dataset contains `r format(nrow(market), big.mark = ",")` daily observations from `r format(min(market$Time), "%B %Y")` through `r format(max(market$Time), "%B %Y")`. The binary target equals one when the daily return is positive and zero otherwise.
+
+Three predictors are constructed:
+
+- **Lagged return:** the previous trading day's return.
+- **Five-day volatility:** the rolling standard deviation of returns through the previous trading day.
+- **Ten-day moving-average gap:** the prior close relative to its trailing ten-day moving average.
+
+Lagging the rolling features is essential. Using the current day's close or return to predict the current day's direction would leak target information into the model and inflate performance.
+
+```{r}
+#| fig-cap: "S&P 500 closing price over the study period. The dashed line marks the chronological train-test split."
+#| fig-width: 8
+#| fig-height: 4.2
+ggplot(model_data, aes(Time, Close.Price)) +
+  geom_line(color = "#1F4E79", linewidth = 0.55) +
+  geom_vline(
+    xintercept = as.numeric(min(test$Time)),
+    linetype = "dashed", color = "#C00000", linewidth = 0.7
+  ) +
+  annotate(
+    "text", x = min(test$Time), y = max(model_data$Close.Price),
+    label = "Test period", hjust = -0.08, vjust = 1.2,
+    color = "#C00000", size = 3.2
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Closing price") +
+  theme(panel.grid.minor = element_blank())
+```
+
+# Modeling Strategy
+
+The first 80% of observations (`r format(nrow(train), big.mark = ",")` rows) form the training set, ending on `r format(max(train$Time), "%B %d, %Y")`. The remaining `r format(nrow(test), big.mark = ",")` observations form the test set, running from `r format(min(test$Time), "%B %d, %Y")` through `r format(max(test$Time), "%B %d, %Y")`.
+
+The full logistic regression is
+
+$$
+\log\left(\frac{P(Y_t=1)}{1-P(Y_t=1)}\right)
+= \beta_0 + \beta_1 R_{t-1} + \beta_2 \sigma_{t-1,5}
++ \beta_3 G_{t-1,10}.
+$$
+
+Candidate specifications are compared with AIC on the training data only. The full model is retained as the common reference specification for the held-out evaluation.
+
+```{r}
+#| tbl-cap: "Candidate-model comparison on the training sample."
+kable(
+  aic_table,
+  digits = 2,
+  col.names = c("Model", "AIC", "Delta AIC")
+)
+```
+
+```{r}
+#| tbl-cap: "Training-sample coefficients for the full logistic regression."
+coefficient_table <- tidy(full_model, conf.int = TRUE) %>%
+  transmute(
+    Term = recode(
+      term,
+      `(Intercept)` = "Intercept",
+      lag_return = "Lagged return",
+      volatility_5d = "Five-day volatility",
+      moving_average_gap = "Ten-day moving-average gap"
+    ),
+    Estimate = estimate,
+    `Std. error` = std.error,
+    `p-value` = p.value,
+    `95% CI lower` = conf.low,
+    `95% CI upper` = conf.high
+  )
+
+kable(coefficient_table, digits = 4)
+```
+
+# Out-of-Sample Evaluation
+
+```{r}
+#| tbl-cap: "Performance on the chronological holdout set."
+performance_table <- tibble(
+  Metric = c(
+    "Test accuracy", "Majority-class baseline", "Balanced accuracy",
+    "Brier score", "Sensitivity", "Specificity"
+  ),
+  Value = c(
+    test_accuracy, baseline_accuracy, balanced_accuracy,
+    brier_score, sensitivity, specificity
+  )
+)
+
+kable(performance_table, digits = 3)
+```
+
+```{r}
+#| fig-cap: "Predicted probability distributions by observed market direction in the test period."
+#| fig-width: 7.5
+#| fig-height: 4.2
+test %>%
+  mutate(
+    Direction = factor(
+      target_up, levels = c(0, 1), labels = c("Down or flat", "Up")
+    )
+  ) %>%
+  ggplot(aes(predicted_probability, fill = Direction)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = 0.50, linetype = "dashed") +
+  scale_fill_manual(values = c("#D95F02", "#1B9E77")) +
+  labs(
+    x = "Predicted probability of an up day",
+    y = "Density", fill = "Observed direction"
+  ) +
+  theme(legend.position = "top", panel.grid.minor = element_blank())
+```
+
+The probability distributions overlap heavily, which is consistent with the model's weak discrimination. Its **`r scales::percent(test_accuracy, accuracy = 0.1)` accuracy is below the `r scales::percent(baseline_accuracy, accuracy = 0.1)` baseline**, and its Brier score is `r round(brier_score, 3)`. The model should not be treated as a deployable trading signal.
+
+# Conclusions and Next Steps
+
+The analysis provides a transparent example of building and testing a financial classification model without look-ahead bias. The lagged return has some training-sample association with market direction, but the combined feature set does not generalize well enough to beat a simple majority-class rule in the holdout period.
+
+Useful next steps would include walk-forward validation, transaction-cost-aware decision rules, richer macroeconomic and market-microstructure features, regularization, and explicit probability calibration. Any future model should continue to be evaluated chronologically and against simple baselines.
+
+This case study is for educational and portfolio purposes only and is not financial advice.
